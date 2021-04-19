@@ -1,0 +1,71 @@
+name: CI/CD dev
+
+env:
+  ENV: dev
+  ECS_SERVICE: apiv-ops-dev-ecs-service
+  ECS_CLUSTER: dev-ecs-on-ec2
+  ECS_TASK_DEFINITION: api-ops-dev
+
+on:
+  push:
+    branches: [ dev ]
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_DEV }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_DEV }}
+          aws-region: us-east-1
+      
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build, tag and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: api-ops-dev
+          IMAGE_TAG: latest
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "::set-output name=image::$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+      
+      - name: Build task definition
+        run: bash ./scripts/github/artifact-build-deploy.sh
+
+      - name: Fill in the new image ID in the Amazon ECS task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ecs-task-definition.json
+          container-name: api-ops-dev-container
+          image: ${{ steps.build-image.outputs.image }}
+
+      - name: Deploy Amazon ECS task definition
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: false
+
+      - name: Deploy task
+        run: |
+          export OLD_TASK_ID=$(aws ecs list-tasks --cluster "$ECS_CLUSTER" --desired-status RUNNING --family "$ECS_TASK_DEFINITION" | egrep "task/" | sed -E "s/.*task\/(.*)\"/\1/")
+          aws ecs stop-task --cluster "$ECS_CLUSTER" --task "$OLD_TASK_ID"
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --task-definition "$TASK_DEFINITION_ARN" \
+            --force-new-deployment
